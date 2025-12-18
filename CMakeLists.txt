@@ -125,4 +125,12 @@ install(
   DESTINATION share/${PROJECT_NAME}
 )
 
+# Install Python scripts
+install(PROGRAMS
+  scripts/global_localization.py
+  scripts/transform_fusion.py
+  scripts/publish_initial_pose.py
+  DESTINATION lib/${PROJECT_NAME}
+)
+
 ament_package()
