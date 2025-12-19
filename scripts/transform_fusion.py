@@ -1,194 +1,115 @@
 #!/usr/bin/env python3
 """
-Transform Fusion Node for FAST-LIO ROS2
-Fuses high-frequency odometry with low-frequency global localization
-Publishes fused pose and TF transforms
+Transform Fusion Node
+TF Tree: map -> odom -> base_link
+需要外部发布 base_link -> livox_frame 的静态变换
 """
 
 import numpy as np
 from scipy.spatial.transform import Rotation
-
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
-
 from nav_msgs.msg import Odometry
 from geometry_msgs.msg import TransformStamped
-from tf2_ros import TransformBroadcaster
-
-
-def pose_to_mat(pose_msg):
-    """Convert ROS Pose/Odometry to 4x4 transformation matrix"""
-    if isinstance(pose_msg, Odometry):
-        pose = pose_msg.pose.pose
-    else:
-        pose = pose_msg
-
-    # Position
-    t = np.array([pose.position.x, pose.position.y, pose.position.z])
-
-    # Rotation
-    q = [pose.orientation.x, pose.orientation.y,
-         pose.orientation.z, pose.orientation.w]
-    R = Rotation.from_quat(q).as_matrix()
-
-    # Transformation matrix
-    T = np.eye(4)
-    T[:3, :3] = R
-    T[:3, 3] = t
-
-    return T
-
-
-def mat_to_odom_msg(T, frame_id, child_frame_id, stamp):
-    """Convert 4x4 transformation matrix to ROS Odometry message"""
-    odom_msg = Odometry()
-    odom_msg.header.frame_id = frame_id
-    odom_msg.header.stamp = stamp
-    odom_msg.child_frame_id = child_frame_id
-
-    # Position
-    odom_msg.pose.pose.position.x = T[0, 3]
-    odom_msg.pose.pose.position.y = T[1, 3]
-    odom_msg.pose.pose.position.z = T[2, 3]
-
-    # Rotation
-    q = Rotation.from_matrix(T[:3, :3]).as_quat()
-    odom_msg.pose.pose.orientation.x = q[0]
-    odom_msg.pose.pose.orientation.y = q[1]
-    odom_msg.pose.pose.orientation.z = q[2]
-    odom_msg.pose.pose.orientation.w = q[3]
-
-    return odom_msg
-
-
-def mat_to_transform_msg(T, frame_id, child_frame_id, stamp):
-    """Convert 4x4 transformation matrix to TransformStamped"""
-    transform_msg = TransformStamped()
-    transform_msg.header.frame_id = frame_id
-    transform_msg.header.stamp = stamp
-    transform_msg.child_frame_id = child_frame_id
-
-    # Translation
-    transform_msg.transform.translation.x = T[0, 3]
-    transform_msg.transform.translation.y = T[1, 3]
-    transform_msg.transform.translation.z = T[2, 3]
-
-    # Rotation
-    q = Rotation.from_matrix(T[:3, :3]).as_quat()
-    transform_msg.transform.rotation.x = q[0]
-    transform_msg.transform.rotation.y = q[1]
-    transform_msg.transform.rotation.z = q[2]
-    transform_msg.transform.rotation.w = q[3]
-
-    return transform_msg
-
+from tf2_ros import TransformBroadcaster, TransformListener, Buffer
 
 class TransformFusionNode(Node):
     def __init__(self):
         super().__init__('transform_fusion_node')
 
-        # State variables
-        self.cur_odom = None
-        self.cur_map_to_odom = None
-        self.last_map_to_odom_time = self.get_clock().now()
+        self.tf_broadcaster = TransformBroadcaster(self)
+        self.tf_buffer = Buffer()
+        self.tf_listener = TransformListener(self.tf_buffer, self)
 
-        # Declare parameters
-        self.declare_parameter('publish_tf', True)
-        self.declare_parameter('fusion_rate', 50.0)  # Hz
+        # 状态量
+        self.T_map_to_odom = np.eye(4)  # map到odom的变换（由重定位更新）
+        self.received_loc = False
 
-        # Get parameters
-        self.publish_tf = self.get_parameter('publish_tf').value
-        fusion_rate = self.get_parameter('fusion_rate').value
-
-        # QoS profile
-        sensor_qos = QoSProfile(
-            reliability=ReliabilityPolicy.BEST_EFFORT,
-            history=HistoryPolicy.KEEP_LAST,
-            depth=10
-        )
-
-        # Subscribers
+        # 订阅FAST-LIO里程计 (camera_init -> body)
+        # body等同于base_link
         self.sub_odom = self.create_subscription(
-            Odometry, '/Odometry',
-            self.odom_callback, sensor_qos
-        )
-        self.sub_map_to_odom = self.create_subscription(
-            Odometry, '/map_to_odom',
-            self.map_to_odom_callback, 10
+            Odometry,
+            '/Odometry',
+            self.odom_callback,
+            10
         )
 
-        # Publishers
-        self.pub_localization = self.create_publisher(
-            Odometry, '/localization', 10
+        # 订阅重定位结果 (修正map->odom)
+        self.sub_map_loc = self.create_subscription(
+            Odometry,
+            '/map_to_odom',
+            self.map_loc_callback,
+            10
         )
 
-        # TF broadcaster
-        if self.publish_tf:
-            self.tf_broadcaster = TransformBroadcaster(self)
+        self.get_logger().info('Transform Fusion Node Initialized')
+        self.get_logger().info('TF Tree: map -> odom -> base_link')
+        self.get_logger().info('Expecting external TF: base_link -> livox_frame')
 
-        # Timer for fusion
-        self.fusion_timer = self.create_timer(
-            1.0 / fusion_rate,
-            self.fusion_callback
-        )
+    def map_loc_callback(self, msg):
+        """接收Global Localization计算出的map->odom变换"""
+        p = msg.pose.pose
+        t = [p.position.x, p.position.y, p.position.z]
+        r = Rotation.from_quat([p.orientation.x, p.orientation.y, p.orientation.z, p.orientation.w])
 
-        self.get_logger().info('Transform Fusion Node initialized')
+        T = np.eye(4)
+        T[:3, :3] = r.as_matrix()
+        T[:3, 3] = t
+
+        self.T_map_to_odom = T
+        self.received_loc = True
+        self.get_logger().info('Updated map->odom transform')
 
     def odom_callback(self, msg):
-        """Callback for high-frequency odometry"""
-        self.cur_odom = msg
+        """
+        高频回调：
+        1. 接收FAST-LIO odom (camera_init -> body)
+        2. 发布map -> odom (固定/低频更新)
+        3. 发布odom -> base_link (高频，来自FAST-LIO)
+        """
+        current_time = msg.header.stamp
 
-    def map_to_odom_callback(self, msg):
-        """Callback for low-frequency global localization result"""
-        self.cur_map_to_odom = msg
-        self.last_map_to_odom_time = self.get_clock().now()
-        self.get_logger().info('Received updated map_to_odom transform',
-                              throttle_duration_sec=2.0)
+        # msg是camera_init -> body
+        # 我们把camera_init当作odom，body当作base_link
+        p = msg.pose.pose
 
-    def fusion_callback(self):
-        """Fuse odometry with global localization"""
-        if self.cur_odom is None:
-            self.get_logger().warn('Waiting for odometry...',
-                                  throttle_duration_sec=5.0)
-            return
+        # --- 发布 odom -> base_link ---
+        t_odom_base = TransformStamped()
+        t_odom_base.header.stamp = current_time
+        t_odom_base.header.frame_id = 'odom'
+        t_odom_base.child_frame_id = 'base_link'
 
-        # Get current timestamp
-        current_time = self.get_clock().now()
+        t_odom_base.transform.translation.x = p.position.x
+        t_odom_base.transform.translation.y = p.position.y
+        t_odom_base.transform.translation.z = p.position.z
+        t_odom_base.transform.rotation = p.orientation
 
-        # If we have global localization, fuse it
-        if self.cur_map_to_odom is not None:
-            # T_map_to_base = T_map_to_odom * T_odom_to_base
-            T_map_to_odom = pose_to_mat(self.cur_map_to_odom)
-            T_odom_to_base = pose_to_mat(self.cur_odom)
-            T_map_to_base = T_map_to_odom @ T_odom_to_base
+        self.tf_broadcaster.sendTransform(t_odom_base)
 
-            # Publish fused localization
-            localization_msg = mat_to_odom_msg(
-                T_map_to_base, 'map', 'body',
-                current_time.to_msg()
-            )
-            self.pub_localization.publish(localization_msg)
+        # --- 发布 map -> odom ---
+        t_map_odom = TransformStamped()
+        t_map_odom.header.stamp = current_time
+        t_map_odom.header.frame_id = 'map'
+        t_map_odom.child_frame_id = 'odom'
 
-            # Publish TF: map -> camera_init
-            if self.publish_tf:
-                tf_msg = mat_to_transform_msg(
-                    T_map_to_odom, 'map', 'camera_init',
-                    current_time.to_msg()
-                )
-                self.tf_broadcaster.sendTransform(tf_msg)
+        # 从T_map_to_odom提取平移和旋转
+        trans = self.T_map_to_odom[:3, 3]
+        rot_mat = self.T_map_to_odom[:3, :3]
+        quat = Rotation.from_matrix(rot_mat).as_quat()
 
-        else:
-            # No global localization yet, just republish odometry
-            # This assumes camera_init is the odom frame
-            self.get_logger().warn('No global localization available yet',
-                                  throttle_duration_sec=5.0)
+        t_map_odom.transform.translation.x = trans[0]
+        t_map_odom.transform.translation.y = trans[1]
+        t_map_odom.transform.translation.z = trans[2]
+        t_map_odom.transform.rotation.x = quat[0]
+        t_map_odom.transform.rotation.y = quat[1]
+        t_map_odom.transform.rotation.z = quat[2]
+        t_map_odom.transform.rotation.w = quat[3]
 
+        self.tf_broadcaster.sendTransform(t_map_odom)
 
 def main(args=None):
     rclpy.init(args=args)
     node = TransformFusionNode()
-
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
@@ -196,7 +117,6 @@ def main(args=None):
     finally:
         node.destroy_node()
         rclpy.shutdown()
-
 
 if __name__ == '__main__':
     main()

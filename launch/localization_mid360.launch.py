@@ -29,7 +29,7 @@ def generate_launch_description():
 
     # Declare launch arguments
     declare_use_sim_time_cmd = DeclareLaunchArgument(
-        'use_sim_time', default_value='false',
+        'use_sim_time', default_value='true',
         description='Use simulation (Gazebo) clock if true'
     )
     declare_config_path_cmd = DeclareLaunchArgument(
@@ -119,6 +119,16 @@ def generate_launch_description():
         condition=IfCondition(rviz_use)
     )
 
+    # Static TF: base_link -> livox_frame
+    # 如果你的雷达相对于base_link有偏移，修改这里的参数
+    static_tf_base_to_livox = Node(
+        package='tf2_ros',
+        executable='static_transform_publisher',
+        name='static_tf_base_to_livox',
+        arguments=['0', '0', '0', '0', '0', '0', 'base_link', 'livox_frame']
+        # 格式: x y z yaw pitch roll parent_frame child_frame
+    )
+
     # Create launch description
     ld = LaunchDescription()
 
@@ -138,6 +148,7 @@ def generate_launch_description():
     ld.add_action(fast_lio_node)
     ld.add_action(global_localization_node)
     ld.add_action(transform_fusion_node)
+    ld.add_action(static_tf_base_to_livox)
     ld.add_action(rviz_node)
 
     return ld

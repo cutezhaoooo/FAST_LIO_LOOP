@@ -13,6 +13,8 @@ import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
 
+import sensor_msgs_py.point_cloud2 as pc2
+from std_msgs.msg import Header
 from sensor_msgs.msg import PointCloud2, PointField
 from nav_msgs.msg import Odometry
 from geometry_msgs.msg import PoseWithCovarianceStamped, PoseStamped, TransformStamped
@@ -239,188 +241,225 @@ def global_localization(pose_estimation):
 
     return False
 
+def pointcloud2_to_o3d(cloud_msg):
+    """Efficiently convert PointCloud2 to Open3D PointCloud"""
+    # 使用 sensor_msgs_py 读取点云数据
+    gen = pc2.read_points(cloud_msg, field_names=("x", "y", "z"), skip_nans=True)
+    points_list = list(gen)
+
+    if not points_list:
+        return o3d.geometry.PointCloud()
+
+    # 提取xyz坐标 - 正确处理结构化数组
+    points_array = np.array(points_list)
+    if points_array.dtype.names:  # 结构化数组
+        xyz = np.zeros((len(points_array), 3), dtype=np.float64)
+        xyz[:, 0] = points_array['x']
+        xyz[:, 1] = points_array['y']
+        xyz[:, 2] = points_array['z']
+    else:  # 普通数组
+        xyz = points_array.astype(np.float64)
+
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(xyz)
+    return pcd
+
+def o3d_to_pointcloud2(pcd, frame_id, stamp):
+    """Convert Open3D PointCloud to ROS2 PointCloud2"""
+    points = np.asarray(pcd.points)
+    header = Header()
+    header.frame_id = frame_id
+    header.stamp = stamp
+    return pc2.create_cloud_xyz32(header, points)
+
+# 全局变量定义（与之前类似，略微调整）
+global_map_o3d = None
+cur_scan_o3d = None
+cur_odom = None
+initialized = False
+# T_map_to_odom 存储 map 到 odom (camera_init) 的变换
+T_map_to_odom = np.eye(4) 
+
+# 参数默认值
+MAP_VOXEL_SIZE = 0.4
+SCAN_VOXEL_SIZE = 0.15
+LOCALIZATION_TH = 0.90
 
 class GlobalLocalizationNode(Node):
     def __init__(self):
         super().__init__('global_localization_node')
 
-        # Declare global variables first
-        global MAP_VOXEL_SIZE, SCAN_VOXEL_SIZE, FREQ_LOCALIZATION
-        global LOCALIZATION_TH, FOV, FOV_FAR
-
-        # Declare parameters
+        # 参数声明
         self.declare_parameter('map_path', '')
         self.declare_parameter('map_voxel_size', MAP_VOXEL_SIZE)
         self.declare_parameter('scan_voxel_size', SCAN_VOXEL_SIZE)
-        self.declare_parameter('localization_freq', FREQ_LOCALIZATION)
         self.declare_parameter('localization_threshold', LOCALIZATION_TH)
-        self.declare_parameter('fov_degree', np.rad2deg(FOV))
-        self.declare_parameter('fov_far', FOV_FAR)
 
-        # Get parameters
         map_path = self.get_parameter('map_path').value
-        MAP_VOXEL_SIZE = self.get_parameter('map_voxel_size').value
-        SCAN_VOXEL_SIZE = self.get_parameter('scan_voxel_size').value
-        FREQ_LOCALIZATION = self.get_parameter('localization_freq').value
-        LOCALIZATION_TH = self.get_parameter('localization_threshold').value
-        FOV = np.deg2rad(self.get_parameter('fov_degree').value)
-        FOV_FAR = self.get_parameter('fov_far').value
+        self.map_voxel_size = self.get_parameter('map_voxel_size').value
+        self.scan_voxel_size = self.get_parameter('scan_voxel_size').value
+        self.loc_th = self.get_parameter('localization_threshold').value
 
-        # QoS profiles
+        # QoS
+        latching_qos = QoSProfile(
+            depth=1,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            reliability=ReliabilityPolicy.RELIABLE
+        )
+
+        # 2. 其他高频话题可以用 Best Effort (如 scan)
         sensor_qos = QoSProfile(
-            reliability=ReliabilityPolicy.BEST_EFFORT,
-            history=HistoryPolicy.KEEP_LAST,
-            depth=10
+            reliability=ReliabilityPolicy.BEST_EFFORT, 
+            history=HistoryPolicy.KEEP_LAST, 
+            depth=1
         )
 
         # Subscribers
-        self.sub_scan = self.create_subscription(
-            PointCloud2, '/cloud_registered',
-            self.scan_callback, sensor_qos
-        )
-        self.sub_odom = self.create_subscription(
-            Odometry, '/Odometry',
-            self.odom_callback, 10
-        )
-        self.sub_initial_pose = self.create_subscription(
-            PoseWithCovarianceStamped, '/initialpose',
-            self.initial_pose_callback, 10
-        )
+        self.sub_scan = self.create_subscription(PointCloud2, '/cloud_registered', self.scan_callback, sensor_qos)
+        self.sub_odom = self.create_subscription(Odometry, '/Odometry', self.odom_callback, sensor_qos)
+        self.sub_initial = self.create_subscription(PoseWithCovarianceStamped, '/initialpose', self.initial_pose_callback, 10)
 
         # Publishers
-        self.pub_map_to_odom = self.create_publisher(
-            Odometry, '/map_to_odom', 10
-        )
-        self.pub_cur_scan_in_map = self.create_publisher(
-            PointCloud2, '/cur_scan_in_map', 10
-        )
-        self.pub_submap = self.create_publisher(
-            PointCloud2, '/submap', 10
-        )
+        self.pub_map_to_odom = self.create_publisher(Odometry, '/map_to_odom', 10) 
+        self.pub_cur_scan_in_map = self.create_publisher(PointCloud2, '/cur_scan_in_map', 10) 
+        
 
-        # Timer for localization
-        self.localization_timer = self.create_timer(
-            1.0 / FREQ_LOCALIZATION,
-            self.localization_callback
-        )
+        self.pub_global_map = self.create_publisher(PointCloud2, '/global_map_viz', latching_qos)
 
-        # Load global map
-        if map_path and map_path != '':
-            self.load_global_map(map_path)
-        else:
-            self.get_logger().warn('No map path provided. Waiting for map...')
+        # Load Map
+        if map_path:
+            self.load_map(map_path)
 
-        self.get_logger().info('Global Localization Node initialized')
+        self.get_logger().info('Global Localization Node Ready.')
 
-    def load_global_map(self, map_path):
-        """Load global map from PCD file"""
-        global global_map_o3d, global_map
-
+    def load_map(self, path):
+        global global_map_o3d
         try:
-            self.get_logger().info(f'Loading global map from: {map_path}')
-            global_map_o3d = o3d.io.read_point_cloud(map_path)
-
-            if len(global_map_o3d.points) == 0:
-                self.get_logger().error('Loaded map is empty!')
-                return
-
-            # Downsample map
-            self.get_logger().info(f'Original map points: {len(global_map_o3d.points)}')
-            global_map_o3d = voxel_down_sample(global_map_o3d, MAP_VOXEL_SIZE)
-            self.get_logger().info(f'Downsampled map points: {len(global_map_o3d.points)}')
-
-            global_map = global_map_o3d
-            self.get_logger().info('Global map loaded successfully!')
-
+            pcd = o3d.io.read_point_cloud(path)
+            global_map_o3d = pcd.voxel_down_sample(self.map_voxel_size)
+            # 发布一次用于 Rviz 显示
+            msg = o3d_to_pointcloud2(global_map_o3d, 'map', self.get_clock().now().to_msg())
+            self.pub_global_map.publish(msg)
+            self.get_logger().info(f'Map loaded: {len(global_map_o3d.points)} points')
         except Exception as e:
-            self.get_logger().error(f'Failed to load map: {str(e)}')
+            self.get_logger().error(f'Map load failed: {e}')
 
     def scan_callback(self, msg):
-        """Callback for received scan"""
-        global cur_scan
-
-        # Convert to Open3D point cloud
-        points = pointcloud2_to_xyz_array(msg)
-        if len(points) > 0:
-            cur_scan = o3d.geometry.PointCloud()
-            cur_scan.points = o3d.utility.Vector3dVector(points)
+        global cur_scan_o3d
+        # 将 ROS msg 转为 Open3D
+        cur_scan_o3d = pointcloud2_to_o3d(msg)
 
     def odom_callback(self, msg):
-        """Callback for received odometry"""
         global cur_odom
         cur_odom = msg
+        
+        # 如果已经初始化成功，持续发布可视化点云
+        if initialized and cur_scan_o3d is not None:
+             self.publish_visuals()
 
     def initial_pose_callback(self, msg):
-        """Callback for initial pose estimate"""
-        global initialized, T_map_to_odom
+        global initialized, T_map_to_odom, cur_odom, cur_scan_o3d
 
-        if global_map_o3d is None:
-            self.get_logger().warn('Global map not loaded yet!')
+        if global_map_o3d is None or cur_scan_o3d is None or cur_odom is None:
+            self.get_logger().warn('Data not ready for localization')
             return
 
-        self.get_logger().info('Received initial pose. Starting localization...')
+        self.get_logger().info('Executing Global Localization...')
 
-        # Get initial pose
-        initial_pose = pose_to_mat(msg)
+        # 1. 获取初始猜测 (T_map_to_livox_guess)
+        T_initial_guess = self.pose_to_mat_msg(msg) # 这是一个 map -> livox 的猜测
 
-        # Try to localize
-        if cur_scan is not None and cur_odom is not None:
-            success = global_localization(initial_pose)
-            if success:
-                initialized = True
-                self.get_logger().info('Initial localization succeeded!')
+        # 2. 获取当前 Odom (T_odom_to_livox)
+        T_odom_to_livox = self.pose_to_mat_msg(cur_odom)
 
-                # Publish result
-                map_to_odom_msg = mat_to_pose_msg(
-                    T_map_to_odom, 'map', self.get_clock().now().to_msg()
-                )
-                self.pub_map_to_odom.publish(map_to_odom_msg)
-            else:
-                self.get_logger().warn('Initial localization failed. Please try again.')
+        # 注意：FAST-LIO 的 cloud_registered 通常是在 odom (camera_init) 坐标系下的
+        # 如果我们直接用 cloud_registered 做匹配，我们要找的是 T_map_to_odom
+        # 初始猜测 T_map_to_odom = T_initial_guess * T_odom_to_livox^-1
+        
+        T_map_to_odom_guess = T_initial_guess @ np.linalg.inv(T_odom_to_livox)
+
+        # 3. 准备 ICP 数据
+        # source: 当前点云 (在 odom 坐标系下)
+        source = cur_scan_o3d
+        # target: 全局地图 (在 map 坐标系下)
+        target = global_map_o3d
+
+        # 4. 执行 ICP
+        # 这里的 trans 是应用在 source 上的，即 T_map_to_odom
+        reg = o3d.pipelines.registration.registration_icp(
+            source, target, 2.0, T_map_to_odom_guess,
+            o3d.pipelines.registration.TransformationEstimationPointToPoint()
+        )
+
+        if reg.fitness > self.loc_th:
+            T_map_to_odom = reg.transformation
+            initialized = True
+            self.get_logger().info(f'Localization Success! Fitness: {reg.fitness}')
+            
+            # 发布变换给 Fusion Node
+            self.publish_map_to_odom()
         else:
-            self.get_logger().warn('Waiting for scan and odom data...')
+            self.get_logger().warn(f'Localization Failed. Fitness: {reg.fitness}')
 
-    def localization_callback(self):
-        """Periodic localization callback"""
-        global initialized, T_map_to_odom, cur_scan, cur_odom
+    def publish_map_to_odom(self):
+        # 将矩阵转为 Odometry 消息发送给 TF 融合节点
+        msg = Odometry()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header.frame_id = 'map'
+        msg.child_frame_id = 'odom' # 这里对应 camera_init
+        
+        t = T_map_to_odom[:3, 3]
+        r = Rotation.from_matrix(T_map_to_odom[:3, :3])
+        q = r.as_quat()
 
-        if not initialized:
-            self.get_logger().warn('Waiting for initial pose...', throttle_duration_sec=5.0)
-            return
+        msg.pose.pose.position.x = t[0]
+        msg.pose.pose.position.y = t[1]
+        msg.pose.pose.position.z = t[2]
+        msg.pose.pose.orientation.x = q[0]
+        msg.pose.pose.orientation.y = q[1]
+        msg.pose.pose.orientation.z = q[2]
+        msg.pose.pose.orientation.w = q[3]
+        
+        self.pub_map_to_odom.publish(msg)
 
-        if cur_scan is None or cur_odom is None or global_map_o3d is None:
-            return
+    def publish_visuals(self):
+        """核心可视化功能：发布当前 scan 在 map 中的位置"""
+        # cur_scan_o3d 目前是在 odom (camera_init) 坐标系下的 (假设来自 cloud_registered)
+        # 我们需要把它变换到 map 坐标系
+        
+        # 1. 拷贝点云防止修改原数据
+        pcd_viz = o3d.geometry.PointCloud(cur_scan_o3d)
+        
+        # 2. 变换: points_map = T_map_to_odom * points_odom
+        pcd_viz.transform(T_map_to_odom)
+        
+        # 3. 转换回 ROS 消息并发布
+        # 注意 frame_id 必须是 map
+        msg = o3d_to_pointcloud2(pcd_viz, 'map', self.get_clock().now().to_msg())
+        self.pub_cur_scan_in_map.publish(msg)
 
-        # Use current map_to_odom estimate
-        T_odom_to_base = pose_to_mat(cur_odom)
-        pose_estimation = T_map_to_odom @ T_odom_to_base
-
-        # Perform localization
-        success = global_localization(pose_estimation)
-
-        if success:
-            # Publish map to odom transform
-            map_to_odom_msg = mat_to_pose_msg(
-                T_map_to_odom, 'map', self.get_clock().now().to_msg()
-            )
-            self.pub_map_to_odom.publish(map_to_odom_msg)
+    def pose_to_mat_msg(self, pose_msg):
+        # (复用之前的逻辑)
+        if isinstance(pose_msg, Odometry):
+            p = pose_msg.pose.pose
+        elif isinstance(pose_msg, PoseWithCovarianceStamped):
+            p = pose_msg.pose.pose
         else:
-            self.get_logger().warn('Localization failed in this iteration',
-                                  throttle_duration_sec=2.0)
-
+            p = pose_msg
+        
+        t = [p.position.x, p.position.y, p.position.z]
+        r = Rotation.from_quat([p.orientation.x, p.orientation.y, p.orientation.z, p.orientation.w])
+        T = np.eye(4)
+        T[:3, :3] = r.as_matrix()
+        T[:3, 3] = t
+        return T
 
 def main(args=None):
     rclpy.init(args=args)
     node = GlobalLocalizationNode()
-
-    try:
-        rclpy.spin(node)
-    except KeyboardInterrupt:
-        pass
-    finally:
-        node.destroy_node()
-        rclpy.shutdown()
-
+    rclpy.spin(node)
+    node.destroy_node()
+    rclpy.shutdown()
 
 if __name__ == '__main__':
     main()
